@@ -1,0 +1,534 @@
+---
+title: "Leucegene data analysis"
+#author: "Farnoosh"
+#date: '2023-03-16'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(survival)
+library(survminer)
+library(Rcpp)
+library(PharmacoGx)
+library(ggplot2)
+library(qs)
+library(meta)
+library(forestplot)
+library(readxl)
+
+```
+
+# Data
+
+Consider the Leucegene AML study including 452 samples across GSE49642, GSE52656, GSE62190, GSE66917, GSE67039, and GSE106272 cohorts. 320 samples remain with available survival outcome (overall survival or OS) where 263 of them with RNA-seq expression values (i.e., log2(TPM + 1)) for the signature analysis including 9 (plus three more signatures) RNA signatures. Due to the lack of clinical data, cohort GSE106272 will be removed from the analyses and 263 samples with remain for the rest of analysis. Genes with zero variance also removed.  
+
+
+```{r AML expression data}
+
+dat_GSE49642 <- qread("~/Data/GSE49642_SE.qs")
+dim(dat_GSE49642)
+
+dat_GSE52656 <- qread("~/Data/GSE52656_SE.qs")
+dim(dat_GSE52656)
+
+dat_GSE62190 <- qread("~/Data/GSE62190_SE.qs")
+dim(dat_GSE62190)
+
+dat_GSE66917 <- qread("~/Data/GSE66917_SE.qs")
+dim(dat_GSE66917)
+
+dat_GSE67039 <- qread("~/Data/GSE67039_SE.qs")
+dim(dat_GSE67039)
+
+dat_GSE106272 <- qread("~/Data/GSE106272_SE.qs")
+dim(dat_GSE106272)
+
+dat <- list(GSE49642 = dat_GSE49642, 
+            GSE52656 = dat_GSE52656, 
+            GSE62190 = dat_GSE62190,
+            GSE66917 = dat_GSE66917, 
+            GSE67039 = dat_GSE67039, 
+            GSE106272 = dat_GSE106272)
+
+## extract expression data
+dat_expr <- lapply(1:length(dat), function(k){
+  
+  as.data.frame(assay(dat[[k]]))
+  
+})
+
+names(dat_expr) <- names(dat)
+
+## sample annotation
+dat_sample_annot <- lapply(1:length(dat), function(k){
+  
+   as.data.frame(colData(dat[[k]]))
+  
+})
+
+names(dat_sample_annot) <- names(dat)
+
+## fix sample names using expression data
+
+dat_expr <- lapply(1:length(dat_expr), function(k){
+  
+  colnames(dat_expr[[k]]) <- dat_sample_annot[[k]]$title
+  dat_expr[[k]]
+  
+})
+
+names(dat_expr) <- names(dat)
+
+## read clinical data (it is private and won't be curated and shared on ORCESTRA)
+
+dat_clinical <- read_xlsx("~/Data/Leucegene.xlsx")
+dat_clinical <- as.data.frame(dat_clinical)
+
+## merge clinical and expression data
+dat_expr_clinical <- lapply(1:(length(dat_expr)-1), function(k){
+  
+  int <- intersect(colnames(dat_expr[[k]]), dat_clinical$`ID BCLQ`)
+  dat_rpkm <- dat_expr[[k]][ , int ]
+  
+## convert RPKM to TPM
+dat_tpm <-  apply(dat_rpkm, 2, function(x) x / sum(as.numeric(x), na.rm = TRUE) * 10^6) %>% as.data.frame()
+  dat_logTPM <- log2(dat_tpm+1)
+  
+  list(expr = dat_logTPM,
+       clinical = dat_clinical[dat_clinical$`ID BCLQ` %in% int, ])
+  
+})
+
+names(dat_expr_clinical)  <- names(dat)[-6]
+
+# Integrate all cohorts
+
+int <- intersect(intersect(intersect(intersect(rownames(dat_expr_clinical[[1]]$expr),            rownames(dat_expr_clinical[[2]]$expr)),
+                 rownames(dat_expr_clinical[[3]]$expr)),
+                 rownames(dat_expr_clinical[[4]]$expr)),
+                 rownames(dat_expr_clinical[[5]]$expr)) # 19837
+
+
+for(i in 1:length(dat_expr_clinical)){
+  
+  dat <- dat_expr_clinical[[i]]$expr
+  dat_expr_clinical[[i]]$expr <- dat[rownames(dat) %in% int, ]
+
+}
+
+
+## merge expression data
+dat_expr <-  dat_expr_clinical[[1]]$expr
+for(i in 2:length(dat_expr_clinical)){
+  
+  dat_expr <- cbind(dat_expr, dat_expr_clinical[[i]]$expr)
+
+}
+  
+get_zero_variance <- apply(dat_expr, 1, var)
+rem <- which(get_zero_variance == 0)
+dat_expr <- dat_expr[-rem, ]
+
+## merge clinical data
+dat_clinical <-  dat_expr_clinical[[1]]$clinical
+for(i in 2:length(dat_expr_clinical)){
+  
+  dat_clinical <- rbind(dat_clinical, dat_expr_clinical[[i]]$clinical)
+
+}
+  
+
+# signature data
+dat_signature <- read.csv("~/Data/signature_updated_April.csv")
+colnames(dat_signature)[c(2,12)] <- c("8gene", "8Drivers")
+
+signature <- lapply(1:ncol(dat_signature ), function(k){
+  
+  sig_val <- dat_signature[, k]
+  sig_val[sig_val != ""]
+
+  })
+
+names(signature) <- colnames(dat_signature)
+str(signature)
+
+```
+
+## Batch Effect 
+
+To assess any potential batches across cohorts after integration, the principal component analysis (PCA) was applied. The scatter plot shows no considerable variation across cohorts. 
+
+```{r batch effect}
+
+group <- c(rep("GSE49642", nrow(dat_expr_clinical$GSE49642$clinical)),
+           rep("GSE52656", nrow(dat_expr_clinical$GSE52656$clinical)),
+           rep("GSE62190", nrow(dat_expr_clinical$GSE62190$clinical)),
+           rep("GSE66917", nrow(dat_expr_clinical$GSE66917$clinical)),
+           rep("GSE67039", nrow(dat_expr_clinical$GSE67039$clinical)))
+
+group <- factor(group)
+cols <- c("#1a9850", "#9970ab", "#4575b4", "#762a83", "#8c510a")
+
+pca_results <- prcomp(t(dat_expr),
+             center = TRUE,
+             scale = TRUE)
+
+propve <- pca_results$sdev^2 / sum(pca_results$sdev^2)
+barplot(round(propve*100, 2)[1:50], ylab = "Proportion of Variance Explained (%)",
+                                    xlab = "principal component (top 50 PCs)")
+
+
+plot(pca_results$x[,1],pca_results$x[,2],pch="+", xlab='PC1 (15.33%)',ylab='PC2 (8.04%)', 
+     main='GEO AML Leucegene cohorts')
+ind= group == levels(group)[1]
+points(pca_results$x[ind,1],pca_results$x[ind,2], pch="+",col=cols[1])
+ind= group == levels(group)[2]
+points(pca_results$x[ind,1],pca_results$x[ind,2], pch="+",col=cols[2])
+ind= group == levels(group)[3]
+points(pca_results$x[ind,1],pca_results$x[ind,2], pch="+",col=cols[3])
+ind= group == levels(group)[4]
+points(pca_results$x[ind,1],pca_results$x[ind,2], pch="+",col=cols[4])
+ind= group == levels(group)[5]
+points(pca_results$x[ind,1],pca_results$x[ind,2], pch="+",col=cols[5])
+legend('bottomleft',paste(levels(group)), pch="+",col=cols, cex=0.5)
+
+
+```
+
+## Signature score and survival analysis
+
+To keep consistency with previous results using GEPIA2 web application, the signature score is computed using mean approach. The Cox regression model is considered to assess the association of signatures with survival outcome (OS) per cohort. Multiple test correction approach; Benjamini \& Hochberg; is applied to correct multiple tests by controlling the false discovery rate (FDR). 
+
+To get the two groups High vs. Low for signature score, two type of thresholds were applied, median or 50 percentile, 75 percentile, and 25 percentile top and 25 percentile bottom. In addition, the continuous signature was applied to assess the association between signature and clinical outcome OS.    
+
+### Median threshold
+
+```{r signature analysis median, echo=TRUE}
+
+# signature score
+signature_score <- lapply(1:length(signature), function(k){ 
+  
+   sub_dat_expr <- dat_expr[rownames(dat_expr) %in% signature[[k]], ]
+   apply(sub_dat_expr, 2, mean)
+  
+})
+
+signature_score <- do.call(rbind, signature_score )
+rownames(signature_score) <- names(signature)
+colnames(signature_score) <- colnames(dat_expr)
+
+# get low vs high signature score: median as threshold
+signature_median <- lapply(1:nrow(signature_score), function(k){
+    
+    ifelse( as.numeric(as.character(signature_score[k,])) >= median(as.numeric(as.character(signature_score[k,]))) , "High" , "Low" )
+    
+}) 
+  
+signature_median  <- do.call(rbind, signature_median)
+rownames(signature_median) <- rownames(signature_score)
+colnames(signature_median) <- colnames(dat_expr)
+
+# number of low vs high per signature
+
+median_low_high_res <- lapply(1:nrow(signature_median), function(k){
+     
+     data.frame(signature_name = rownames(signature_median)[k],
+                n_low = length(signature_median[k, ][signature_median[k,] == "Low"]),
+                n_high = length(signature_median[k, ][signature_median[k,] == "High"]))
+  
+})
+
+median_low_high_res  <- do.call(rbind, median_low_high_res)
+write.csv(median_low_high_res, file="~/Result/LeucegeneAML/low_high_median.csv")
+
+# KM plot along with log-rank test
+  
+for(j in 1:nrow(signature_median)){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_median[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/LeucegeneAML/ALL/KM/Median", 
+                                    rownames(signature_median)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("median", rownames(signature_median)[j], sep = ":"))
+     print(p)
+     dev.off()
+    
+  }
+  
+
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_median), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_median[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     
+      fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/LeucegeneAML/res_ALL_cox_median.csv")
+print(res_Cox)
+
+```
+
+
+\newpage
+
+### Percentile threshold (top 25\% and bottom 25\%)
+
+```{r signature analysis percentile 25, echo=TRUE}
+
+# get low vs high signature score: 75% Percentile as threshold
+signature_percentile <- lapply(1:nrow(signature_score), function(j){
+  
+    qt <- quantile( as.numeric(as.character(signature_score[j,])) , na.rm=TRUE , probs= c( 0.25, 0.75 ) )
+    ifelse( as.numeric(as.character(signature_score[j,])) <= qt[1] , "Low" , 
+						ifelse( as.numeric(as.character(signature_score[j,])) <= qt[2] , "Median" , 
+						ifelse( as.numeric(as.character(signature_score[j,])) > qt[2] , "High" , NA ) ) ) 
+     }
+   )
+
+signature_percentile <- do.call(rbind, signature_percentile)
+rownames(signature_percentile) <- names(signature)
+colnames(signature_percentile) <- colnames(dat_expr)
+
+# number of low vs high per signature
+percentile_low_high_res <- lapply(1:nrow(signature_percentile), function(k){
+     
+     data.frame(signature_name = rownames(signature_percentile)[k],
+                n_low = length(signature_percentile[k, ][signature_percentile[k,] == "Low"]),
+                n_high = length(signature_percentile[k, ][signature_percentile[k,] == "High"]))
+  
+})
+
+percentile_low_high_res  <- do.call(rbind, percentile_low_high_res)
+write.csv(percentile_low_high_res, file="~/Result/LeucegeneAML/low_high_percentile_25_25.csv")
+# KM plot along with log-rank test
+
+for(j in 1:nrow(signature_percentile)){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[df$sigScore != "Median", ]
+     df <- df[!is.na(df$sigScore), ]
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/LeucegeneAML/ALL/KM/Percentile_25", 
+                                    rownames(signature_percentile)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("Percentile", rownames(signature_percentile)[j], sep = ":"))
+   print(p)
+   dev.off()
+    
+  }
+  
+  
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_percentile), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     df <- df[df$sigScore != "Median", ]
+     
+      fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/LeucegeneAML/res_ALL_cox_percentile_25.csv")
+print(res_Cox)
+
+```
+
+
+\newpage
+
+### Percentile threshold 
+
+```{r signature analysis percentile, echo=TRUE}
+
+# get low vs high signature score: 75% Percentile as threshold
+signature_percentile <- lapply(1:nrow(signature_score), function(j){
+  
+    qt <- quantile( as.numeric(as.character(signature_score[j,])) , na.rm=TRUE , probs= c( 0.75 ) )
+  ifelse( as.numeric(as.character(signature_score[j,])) >= qt , "High" , "Low" )
+
+  })
+
+signature_percentile <- do.call(rbind, signature_percentile)
+rownames(signature_percentile) <- names(signature)
+colnames(signature_percentile) <- colnames(dat_expr)
+
+# number of low vs high per signature
+percentile_low_high_res <- lapply(1:nrow(signature_percentile), function(k){
+     
+     data.frame(signature_name = rownames(signature_percentile)[k],
+                n_low = length(signature_percentile[k, ][signature_percentile[k,] == "Low"]),
+                n_high = length(signature_percentile[k, ][signature_percentile[k,] == "High"]))
+  
+})
+
+percentile_low_high_res  <- do.call(rbind, percentile_low_high_res)
+write.csv(percentile_low_high_res, file="~/Result/LeucegeneAML/low_high_percentile.csv")
+# KM plot along with log-rank test
+
+for(j in 1:nrow(signature_percentile)){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/LeucegeneAML/ALL/KM/Percentile", 
+                                    rownames(signature_percentile)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("Percentile", rownames(signature_percentile)[j], sep = ":"))
+   print(p)
+   dev.off()
+    
+  }
+  
+  
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_percentile), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     
+      fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/LeucegeneAML/res_ALL_cox_percentile.csv")
+print(res_Cox)
+
+```
+
+\newpage
+
+## Continuous signature
+
+Consider the Cox proportional hazard model to assess the association between signature score (as continuous variable) and survival outcomes.  
+
+```{r signature analysis continuous, echo=TRUE}
+
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_score), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_clinical$`OS Days`),
+                 status = as.numeric(dat_clinical$`OS Censoring Status`),
+                 sigScore = signature_score[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     
+      fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/LeucegeneAML/res_ALL_cox_continuous.csv")
+
+print(res_Cox)
+
+```
+
+
+
+
+
+
