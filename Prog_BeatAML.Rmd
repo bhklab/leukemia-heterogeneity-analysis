@@ -1,0 +1,407 @@
+---
+title: "BeatAML data analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(survival)
+library(survminer)
+library(Rcpp)
+library(PharmacoGx)
+library(ggplot2)
+
+# convert lof2(TPM+0.001) to log2(TPM+1) 
+get_tpm <- function(x){
+ 
+  tpm_val <- 2^(x) - 0.001
+  log2TPM <- round(log2(tpm_val + 1), 6)
+  
+}
+
+```
+
+# Data
+
+Consider the BeatAML study for the following analyses. 320 samples remain with available survival outcome (overall survival or OS) and RNA-seq expression values (i.e., log2(TPM + 1)) for the signature analysis including 8 RNA signatures.  
+
+```{r AML data}
+
+dat <- readRDS("~/Data/BeatAML.rds")
+dat_updated <- updateObject(dat)
+
+dat_expr <- assay(dat_updated@molecularProfiles$rnaseq) # log2(TPM+0.001): 510 samples and 60k genes
+
+dat_annot <- data.frame(rowData(dat_updated@molecularProfiles$rnaseq))
+dat_sample <- dat_updated@sample
+
+# convert ENS gene id to symbol. Remove duplicated gene symbols
+dat_annot <- dat_annot[!duplicated(dat_annot$Symbol), ]
+dat_expr <- dat_expr[rownames(dat_expr) %in% rownames(dat_annot), ]
+rownames(dat_expr) <- dat_annot$Symbol
+
+# remove NA values using OS and vital status variables (30 patients with unknown status)
+dat_sample_os <- dat_sample[!is.na(dat_sample$overallSurvival), ]
+dat_sample_os <- dat_sample_os[!is.na(dat_sample_os$vitalStatus), ]
+dat_sample_os <- dat_sample_os[dat_sample_os$vitalStatus != "Unknown", ]
+
+int <- intersect(colnames(dat_expr), rownames(dat_sample_os))# 320 samples have survival outcome and expression data
+dat_expr_os <- dat_expr[, colnames(dat_expr) %in% int]
+dat_expr_os <- dat_expr_os[, order(colnames(dat_expr_os))]
+dat_sample_os <- dat_sample_os[rownames(dat_sample_os) %in% int, ]
+dat_sample_os <- dat_sample_os[order(rownames(dat_sample_os)), ]
+
+# convert log2(TPM+0.001) to log2(TPM+1) 
+dat_expr_os <- get_tpm(dat_expr_os)
+dim(dat_expr_os)
+
+# signature data
+dat_signature <- read.csv("~/Data/signature_updated_April.csv")
+colnames(dat_signature)[c(2,12)] <- c("8gene", "8Drivers")
+signature <- lapply(1:ncol(dat_signature ), function(k){
+  
+  sig_val <- dat_signature[, k]
+  sig_val[sig_val != ""]
+
+  })
+
+names(signature) <- colnames(dat_signature)
+str(signature)
+
+```
+
+## Signature score and survival analysis
+
+To keep consistency with previous results using GEPIA2 web application, the signature score is computed using mean approach. The Cox regression model is considered to assess the association of signatures with survival outcome (OS) per cohort. Multiple test correction approach; Benjamini \& Hochberg; is applied to correct multiple tests by controlling the false discovery rate (FDR). 
+
+To get the two groups High vs. Low for signature score, two type of thresholds were applied, median or 50 percentile, 75 percentile, and 25 percentile top and 25 percentile bottom. In addition, the continuous signature was applied to assess the association between signature and clinical outcome OS.       
+
+
+### Median threshold
+
+```{r signature analysis median, echo=TRUE}
+# signature score
+signature_score <- lapply(1:length(signature), function(k){
+  
+  sub_dat_expr_os <- dat_expr_os[rownames(dat_expr_os) %in% signature[[k]], ]
+  apply(sub_dat_expr_os, 2, mean)
+  
+})
+
+signature_score_dat <- do.call(rbind, signature_score)
+rownames( signature_score_dat) <- names(signature)
+
+# get low vs high signature score: median as threshold
+signature_median <- lapply(1:nrow(signature_score_dat), function(k){
+  
+  ifelse( as.numeric(as.character(signature_score_dat[k,])) >= median(as.numeric(as.character(signature_score_dat[k,]))) , "High" , "Low" )
+  
+})
+
+signature_median <- do.call(rbind, signature_median) 
+rownames(signature_median) <- rownames(signature_score_dat)
+colnames(signature_median) <- colnames(signature_score_dat)
+
+# number of low vs high per signature
+
+median_low_high_res <- lapply(1:nrow(signature_median), function(k){
+     
+     data.frame(signature_name = rownames(signature_median)[k],
+                n_low = length(signature_median[k, ][signature_median[k,] == "Low"]),
+                n_high = length(signature_median[k, ][signature_median[k,] == "High"]))
+  
+})
+
+median_low_high_res  <- do.call(rbind, median_low_high_res)
+write.csv(median_low_high_res, file="~/Result/BeatAML/low_high_median.csv")
+
+# KM plot along with log-rank test
+  
+for(j in 1:nrow(signature_median)){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_median[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/BeatAML/KM/Median", 
+                                    rownames(signature_median)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("median", rownames(signature_median)[j], sep = ":"))
+     print(p)
+     dev.off()
+    
+  }
+  
+
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_median), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_median[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+     fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/BeatAML/res_ALL_cox_median.csv")
+print(res_Cox)
+
+
+```
+
+\newpage
+
+### Percentile threshold (top 25\% and bottom 25\%)
+
+```{r signature analysis percentile 25, echo=TRUE}
+
+# get low vs high signature score: 75% Percentile as threshold
+signature_percentile <- lapply(1:nrow(signature_score_dat), function(j){
+  
+    qt <- quantile( as.numeric(as.character(signature_score_dat[j,])) , na.rm=TRUE , probs= c( 0.25, 0.75 ) )
+    ifelse( as.numeric(as.character(signature_score_dat[j,])) <= qt[1] , "Low" , 
+						ifelse( as.numeric(as.character(signature_score_dat[j,])) <= qt[2] , "Median" , 
+						ifelse( as.numeric(as.character(signature_score_dat[j,])) > qt[2] , "High" , NA ) ) ) 
+     }
+   )
+
+signature_percentile <- do.call(rbind, signature_percentile)
+rownames(signature_percentile) <- names(signature)
+colnames(signature_percentile) <- colnames(dat_expr_os)
+
+# number of low vs high per signature
+percentile_low_high_res <- lapply(1:nrow(signature_percentile), function(k){
+     
+     data.frame(signature_name = rownames(signature_percentile)[k],
+                n_low = length(signature_percentile[k, ][signature_percentile[k,] == "Low"]),
+                n_high = length(signature_percentile[k, ][signature_percentile[k,] == "High"]))
+  
+})
+
+percentile_low_high_res  <- do.call(rbind, percentile_low_high_res)
+write.csv(percentile_low_high_res, file="~/Result/LeucegeneAML/low_high_percentile_25_25.csv")
+
+# KM plot along with log-rank test
+
+for(j in 1:nrow(signature_percentile)){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[df$sigScore != "Median", ]
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/BeatAML/KM/Percentile_25", 
+                                    rownames(signature_percentile)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("Percentile", rownames(signature_percentile)[j], sep = ":"))
+   print(p)
+   dev.off()
+    
+  }
+  
+  
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_percentile), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[df$sigScore != "Median", ]
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+      fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/BeatAML/res_ALL_cox_percentile_25.csv")
+print(res_Cox)
+
+```
+
+
+\newpage
+
+### Percentile threshold
+
+```{r signature analysis percentile, echo=TRUE}
+
+signature_percentile <- lapply(1:nrow(signature_score_dat), function(k){
+  
+  qt <- quantile( as.numeric(as.character(signature_score_dat[k,])) , na.rm=TRUE , probs= c( 0.75 ) )
+  ifelse( as.numeric(as.character(signature_score_dat[k,])) >= qt , "High" , "Low" )
+  
+})
+
+signature_percentile <- do.call(rbind, signature_percentile) 
+rownames(signature_percentile) <- rownames(signature_score_dat)
+colnames(signature_percentile) <- colnames(signature_score_dat)
+
+# number of low vs high per signature
+percentile_low_high_res <- lapply(1:nrow(signature_percentile), function(k){
+     
+     data.frame(signature_name = rownames(signature_percentile)[k],
+                n_low = length(signature_percentile[k, ][signature_percentile[k,] == "Low"]),
+                n_high = length(signature_percentile[k, ][signature_percentile[k,] == "High"]))
+  
+})
+
+percentile_low_high_res  <- do.call(rbind, percentile_low_high_res)
+write.csv(percentile_low_high_res, file="~/Result/BeatAML/low_high_percentile.csv")
+
+# KM plot along with log-rank test
+  
+for(j in 1:nrow(signature_percentile)){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+     fit <- survfit(Surv(time, status) ~ sigScore, data = df)
+     
+      jpeg(file = paste(paste("~/Result/BeatAML/KM/Percentile", 
+                                    rownames(signature_median)[j],  sep="/"), ".jpg", sep=""),
+     res=600, width=2700, height=2500)
+    
+      p <- ggsurvplot(fit, 
+           data = df, 
+           palette =
+           c("Red", "Blue"),
+           legend.labs = c("High", "Low"),
+           pval = TRUE,
+           pval.size = 3, 
+           xlab = "Days",
+           ylab = "Percent survival",
+           title = paste("Percentile", rownames(signature_median)[j], sep = ":"))
+     print(p)
+     dev.off()
+    
+  }
+  
+
+## get the cox results for meta-analysis
+res_Cox <- lapply(1:nrow(signature_percentile), function(j){
+    
+     df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_percentile[j, ])
+     
+     df <- df[!is.na(df$sigScore), ]
+     df$status <- ifelse(df$status == "Dead", 1, 0)
+     
+     fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+     data.frame(signature = rownames(signature_median)[j],
+             n = summary(fit)$n,
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             SE = round(summary(fit)$coefficients[, "se(coef)"], 3),
+             pval = summary(fit)$coefficients[, "Pr(>|z|)"]
+             )
+    
+    
+  })
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/BeatAML/res_ALL_cox_percentile.csv")
+print(res_Cox)
+
+```
+
+\newpage
+
+## Continuous signature
+
+Consider the Cox proportional hazard model to assess the association between signature score (as continuous variable) and survival outcomes.  
+
+```{r signature analysis continuous, echo=TRUE}
+
+res_Cox <- lapply(1:nrow(signature_score_dat), function(k){
+  
+  df <- data.frame(time = as.numeric(dat_sample_os$overallSurvival),
+                 status = dat_sample_os$vitalStatus,
+                 sigScore = signature_score_dat[k, ])
+  
+  df$status <- ifelse(df$status == "Dead", 1, 0)
+  
+  fit <- coxph(Surv(time, status) ~ sigScore, data = df) 
+  
+  data.frame(signature = rownames(signature_score_dat)[k],
+             logHR = round(summary(fit)$coefficients[, "coef"], 3),
+             pval = round(summary(fit)$coefficients[, "Pr(>|z|)"], 3)
+             )
+  
+})
+
+res_Cox <- do.call(rbind, res_Cox)
+res_Cox$FDR <- p.adjust(res_Cox$pval, method="BH")
+
+write.csv(res_Cox, file="~/Result/BeatAML/res_ALL_cox_continuous.csv")
+
+print(res_Cox)
+
+```
+
